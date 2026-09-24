@@ -1,0 +1,67 @@
+name: Build and verify runtime
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      REGISTRY: ocir.ap-osaka-1.oci.oraclecloud.com
+      IMAGE: ocir.ap-osaka-1.oci.oraclecloud.com/axvv5piuvoot/sidera-runpod-runtime:node22.23.1-20260924-r1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build isolated runtime context
+        run: docker build --platform linux/amd64 --tag "$IMAGE" runtime
+      - name: Verify tools and no baked keys with network disabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect "$IMAGE" --format '{{.Architecture}}')" = amd64
+          docker run --rm --network none --entrypoint /bin/bash "$IMAGE" -c '
+            set -eu
+            test "$(node --version)" = v22.23.1
+            for tool in ssh sshd scp sftp zstd tar flock python3 curl; do command -v "$tool"; done
+            test ! -e /root/.ssh/authorized_keys
+            test ! -e /root/.openai-key
+            ! compgen -G "/etc/ssh/ssh_host_*"
+          '
+      - name: Verify offline SSH and SFTP with per-job keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/client"
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/host"
+          export PUBLIC_KEY="$(cat "$RUNNER_TEMP/client.pub")"
+          export SHADOW_POD_HOST_KEY_B64="$(base64 -w0 "$RUNNER_TEMP/host")"
+          docker run -d --network none --name runtime-check -e PUBLIC_KEY -e SHADOW_POD_HOST_KEY_B64 \
+            --entrypoint /bin/bash "$IMAGE" -lc "$(cat runtime-bootstrap.sh)"
+          unset PUBLIC_KEY SHADOW_POD_HOST_KEY_B64
+          docker cp "$RUNNER_TEMP/client" runtime-check:/tmp/client
+          printf '127.0.0.1 %s\n' "$(cat "$RUNNER_TEMP/host.pub")" > "$RUNNER_TEMP/known_hosts"
+          docker cp "$RUNNER_TEMP/known_hosts" runtime-check:/tmp/known_hosts
+          for i in $(seq 1 20); do
+            if docker exec runtime-check ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/known_hosts -i /tmp/client root@127.0.0.1 'test "$(node --version)" = v22.23.1'; then break; fi
+            sleep 1
+          done
+          docker exec runtime-check ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/known_hosts -i /tmp/client root@127.0.0.1 'test "$(node --version)" = v22.23.1'
+          printf 'put /etc/os-release /tmp/roundtrip\nget /tmp/roundtrip /tmp/received\n' | docker exec -i runtime-check sftp -b - -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/known_hosts -i /tmp/client root@127.0.0.1
+          docker exec runtime-check cmp /etc/os-release /tmp/received
+          docker exec runtime-check sh -c '! tr "\000" "\n" </proc/1/environ | grep -E "^(PUBLIC_KEY|SHADOW_POD_HOST_KEY_B64)="'
+          docker rm -f runtime-check
+      - name: Publish a new version without overwriting an existing tag
+        shell: bash
+        env:
+          OCIR_USERNAME: ${{ secrets.OCIR_USERNAME }}
+          OCIR_TOKEN: ${{ secrets.OCIR_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$OCIR_TOKEN" | docker login "$REGISTRY" --username "$OCIR_USERNAME" --password-stdin
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo 'Refusing to overwrite a published runtime tag' >&2
+            exit 1
+          fi
+          docker push "$IMAGE"
+          docker image inspect "$IMAGE" --format '{{json .RepoDigests}}'
+          docker logout "$REGISTRY"
